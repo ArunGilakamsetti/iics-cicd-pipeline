@@ -1,0 +1,11 @@
+# IICS CLI (if you place it locally)
+/iics-cli/iics
+/iics-cli/iics.exe
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+Thumbs.db

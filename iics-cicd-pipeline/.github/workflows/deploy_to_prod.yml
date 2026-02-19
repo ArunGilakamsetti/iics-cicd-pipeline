@@ -1,0 +1,86 @@
+name: Deploy to Production
+
+on:
+  push:
+    paths:
+      - 'exports/prod-ready/*.zip'
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      package_file:
+        description: 'Package file to deploy'
+        required: true
+
+env:
+  IICS_REGION: us
+  PROD_POD_URL: ${{ secrets.PROD_POD_URL }}
+  PROD_USERNAME: ${{ secrets.PROD_IICS_USERNAME }}
+  PROD_PASSWORD: ${{ secrets.PROD_PASSWORD }}
+
+jobs:
+  pre-deploy:
+    runs-on: ubuntu-latest
+    outputs:
+      package: ${{ steps.package.outputs.package }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Determine package
+        id: package
+        run: |
+          if [[ "${{ github.event.inputs.package_file }}" != "" ]]; then
+            PACKAGE="${{ github.event.inputs.package_file }}"
+          else
+            PACKAGE=$(ls -t exports/prod-ready/*.zip | head -1)
+          fi
+          echo "package=$PACKAGE" >> $GITHUB_OUTPUT
+
+  deploy:
+    needs: pre-deploy
+    runs-on: ubuntu-latest
+    environment: prod-approval   # Requires manual approval
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Download IICS CLI
+        run: |
+          mkdir -p ./iics-cli
+          curl -L -o ./iics-cli/iics https://github.com/InformaticaCloudApplicationIntegration/Tools/raw/master/IICS%20Asset%20Management%20CLI/v2/linux-x86_64/iics
+          chmod +x ./iics-cli/iics
+
+      - name: Create backup of current production state
+        run: |
+          BACKUP_NAME="pre-prod-backup-$(date +'%Y%m%d%H%M%S')"
+          ./iics-cli/iics export \
+            -n "$BACKUP_NAME" \
+            -r ${{ env.IICS_REGION }} \
+            --podHostName ${{ env.PROD_POD_URL }} \
+            -u ${{ env.PROD_USERNAME }} \
+            -p ${{ env.PROD_PASSWORD }} \
+            --artifacts "Explore/Default.Project" \
+            --zipFilePath "./backups/$BACKUP_NAME.zip"
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add ./backups/
+          git commit -m "backup: $BACKUP_NAME" || echo "No changes to commit"
+          git push
+
+      - name: Import to Production
+        run: |
+          ./iics-cli/iics import \
+            -n "Prod-Deploy-$(date +'%Y%m%d%H%M%S')" \
+            -r ${{ env.IICS_REGION }} \
+            --podHostName ${{ env.PROD_POD_URL }} \
+            -u ${{ env.PROD_USERNAME }} \
+            -p ${{ env.PROD_PASSWORD }} \
+            -z ${{ needs.pre-deploy.outputs.package }} \
+            -s true
+
+      - name: Smoke tests
+        run: |
+          python scripts/validate_import.py --environment prod --smoke-test
+
+      - name: Notify success
+        run: |
+          echo "Production deployment of ${{ needs.pre-deploy.outputs.package }} succeeded."

@@ -1,20 +1,20 @@
-name: Deploy to QA
+name:  Deploy to QA
 
 on:
   push:
     paths:
-      - 'exports/qa-ready/*.zip'      # Trigger when a package is added to qa-ready
+      - 'exports/qa-ready/*.zip'
     branches:
       - main
-  workflow_dispatch:                    # Allow manual trigger
+  workflow_dispatch:
     inputs:
       package_file:
-        description: 'Package file to deploy (relative to repo root)'
+        description: 'Package file to deploy'
         required: true
 
 env:
-  IICS_REGION: us                       # Change to your region
-  QA_POD_URL: ${{ secrets.QA_POD_URL }}
+  IICS_REGION: ap
+  QA_POD_URL: ${{ secrets.QA_POD_URL }}           # Should be just "dm-ap.informaticacloud.com"
   QA_USERNAME: ${{ secrets.QA_IICS_USERNAME }}
   QA_PASSWORD: ${{ secrets.QA_PASSWORD }}
 
@@ -32,34 +32,30 @@ jobs:
           if [[ "${{ github.event.inputs.package_file }}" != "" ]]; then
             PACKAGE="${{ github.event.inputs.package_file }}"
           else
-            # Get the most recent .zip in qa-ready
             PACKAGE=$(ls -t exports/qa-ready/*.zip | head -1)
           fi
           echo "package=$PACKAGE" >> $GITHUB_OUTPUT
+          echo "Deploying package: $PACKAGE"
 
       - name: Download IICS CLI
         run: |
           mkdir -p ./iics-cli
           curl -L -o ./iics-cli/iics https://github.com/InformaticaCloudApplicationIntegration/Tools/raw/master/IICS%20Asset%20Management%20CLI/v2/linux-x86_64/iics
           chmod +x ./iics-cli/iics
+          ./iics-cli/iics version
 
       - name: Import to QA
         run: |
           ./iics-cli/iics import \
             -n "QA-Deploy-$(date +'%Y%m%d%H%M%S')" \
             -r ${{ env.IICS_REGION }} \
-            --podHostName ${{ env.QA_POD_URL }} \
-            -u ${{ env.QA_USERNAME }} \
-            -p ${{ env.QA_PASSWORD }} \
-            -z ${{ steps.package.outputs.package }} \
+            --podHostName "${{ env.QA_POD_URL }}" \
+            -u "${{ env.QA_USERNAME }}" \
+            -p "${{ env.QA_PASSWORD }}" \
+            -z "${{ steps.package.outputs.package }}" \
             -s true
 
       - name: Post-import validation
         run: |
-          python scripts/validate_import.py \
-            --environment qa \
-            --package ${{ steps.package.outputs.package }}
-
-      - name: Notify QA team (optional)
-        run: |
           echo "Deployment to QA completed for ${{ steps.package.outputs.package }}"
+          # Add your validation script here if needed

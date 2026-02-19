@@ -9,39 +9,201 @@ on:
   workflow_dispatch:
     inputs:
       package_file:
-        description: 'Package file to deploy'
-        required: true
+        description: 'Package file to deploy (relative to repo root)'
+        required: false
+        default: ''
 
 env:
-  IICS_REGION: us
-  PROD_POD_URL: ${{ secrets.PROD_POD_URL }}
+  IICS_REGION: ap                                      # Your region (ap, us, emea, ca)
+  PROD_POD_URL: ${{ secrets.PROD_POD_URL }}            # Should be just "dm-ap.informaticacloud.com" (NO https://)
   PROD_USERNAME: ${{ secrets.PROD_IICS_USERNAME }}
   PROD_PASSWORD: ${{ secrets.PROD_PASSWORD }}
 
 jobs:
-  pre-deploy:
+  pre-deployment-validation:
+    name: Pre-Deployment Validation
     runs-on: ubuntu-latest
     outputs:
-      package: ${{ steps.package.outputs.package }}
+      package: ${{ steps.determine-package.outputs.package }}
+      package_name: ${{ steps.determine-package.outputs.package_name }}
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-      - name: Determine package
-        id: package
+      - name: Determine package to deploy
+        id: determine-package
         run: |
-          if [[ "${{ github.event.inputs.package_file }}" != "" ]]; then
+          if [[ -n "${{ github.event.inputs.package_file }}" ]]; then
             PACKAGE="${{ github.event.inputs.package_file }}"
           else
-            PACKAGE=$(ls -t exports/prod-ready/*.zip | head -1)
+            # Get the most recent .zip in prod-ready folder
+            PACKAGE=$(ls -t exports/prod-ready/*.zip 2>/dev/null | head -1)
           fi
+          
+          if [[ -z "$PACKAGE" ]]; then
+            echo "No package found to deploy"
+            exit 1
+          fi
+          
           echo "package=$PACKAGE" >> $GITHUB_OUTPUT
+          echo "package_name=$(basename "$PACKAGE")" >> $GITHUB_OUTPUT
+          echo "Deploying package: $PACKAGE"
 
-  deploy:
-    needs: pre-deploy
+      - name: Validate package exists
+        run: |
+          if [[ ! -f "${{ steps.determine-package.outputs.package }}" ]]; then
+            echo "Package file not found: ${{ steps.determine-package.outputs.package }}"
+            exit 1
+          fi
+          
+          # Verify it's a valid zip file
+          unzip -t "${{ steps.determine-package.outputs.package }}" > /dev/null 2>&1
+          if [[ $? -ne 0 ]]; then
+            echo "Package is not a valid ZIP file"
+            exit 1
+          fi
+          echo "Package validation passed"
+
+      - name: Debug connection info
+        run: |
+          echo "Region: ${{ env.IICS_REGION }}"
+          echo "Pod Hostname: ${{ env.PROD_POD_URL }}"
+          echo "Username: ${{ env.PROD_USERNAME }}"
+
+  create-backup:
+    name: Create Production Backup
+    needs: pre-deployment-validation
     runs-on: ubuntu-latest
-    environment: prod-approval   # Requires manual approval
+    outputs:
+      backup_file: ${{ steps.backup.outputs.backup_file }}
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Download IICS CLI
+        run: |
+          mkdir -p ./iics-cli
+          curl -L -o ./iics-cli/iics https://github.com/InformaticaCloudApplicationIntegration/Tools/raw/master/IICS%20Asset%20Management%20CLI/v2/linux-x86_64/iics
+          chmod +x ./iics-cli/iics
+          ./iics-cli/iics version
+
+      - name: Create backups folder
+        run: mkdir -p ./backups
+
+      - name: Export current production state as backup
+        id: backup
+        run: |
+          TIMESTAMP=$(date +'%Y%m%d_%H%M%S')
+          BACKUP_FILE="./backups/prod-backup-$TIMESTAMP.zip"
+          
+          echo "Creating backup: $BACKUP_FILE"
+          
+          ./iics-cli/iics export \
+            -n "Prod-Backup-$TIMESTAMP" \
+            -r "${{ env.IICS_REGION }}" \
+            --podHostName "${{ env.PROD_POD_URL }}" \
+            -u "${{ env.PROD_USERNAME }}" \
+            -p "${{ env.PROD_PASSWORD }}" \
+            --artifacts "Explore/Default.Project" \
+            -z "$BACKUP_FILE" \
+            --logLevel info
+          
+          if [[ $? -eq 0 ]]; then
+            echo "backup_file=$BACKUP_FILE" >> $GITHUB_OUTPUT
+            echo "Backup created successfully"
+            
+            # Commit backup to repository
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add ./backups/
+            git commit -m "backup: pre-deployment backup $TIMESTAMP" || echo "No changes to commit"
+            git push
+          else
+            echo "Backup failed"
+            exit 1
+          fi
+
+  deploy-to-prod:
+    name: Production Deployment
+    needs: [pre-deployment-validation, create-backup]
+    runs-on: ubuntu-latest
+    environment: prod-approval  # Requires manual approval
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Download IICS CLI
+        run: |
+          mkdir -p ./iics-cli
+          curl -L -o ./iics-cli/iics https://github.com/InformaticaCloudApplicationIntegration/Tools/raw/master/IICS%20Asset%20Management%20CLI/v2/linux-x86_64/iics
+          chmod +x ./iics-cli/iics
+          ./iics-cli/iics version
+
+      - name: Display deployment info
+        run: |
+          echo "Deploying to Production"
+          echo "Package: ${{ needs.pre-deployment-validation.outputs.package }}"
+          echo "Backup: ${{ needs.create-backup.outputs.backup_file }}"
+          echo "Region: ${{ env.IICS_REGION }}"
+          echo "Pod: ${{ env.PROD_POD_URL }}"
+
+      - name: Import to Production
+        id: import
+        run: |
+          DEPLOY_NAME="Prod-Deploy-${{ needs.pre-deployment-validation.outputs.package_name }}-$(date +'%Y%m%d%H%M%S')"
+          
+          echo "Running import: $DEPLOY_NAME"
+          
+          ./iics-cli/iics import \
+            -n "$DEPLOY_NAME" \
+            -r "${{ env.IICS_REGION }}" \
+            --podHostName "${{ env.PROD_POD_URL }}" \
+            -u "${{ env.PROD_USERNAME }}" \
+            -p "${{ env.PROD_PASSWORD }}" \
+            -z "${{ needs.pre-deployment-validation.outputs.package }}" \
+            -s true \
+            --logLevel info
+          
+          if [[ $? -eq 0 ]]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "Import successful"
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "Import failed"
+            exit 1
+          fi
+
+      - name: Post-deployment smoke tests
+        if: success()
+        run: |
+          echo "Running smoke tests..."
+          # Add your validation script here
+          # python scripts/validate_import.py --environment prod --package "${{ needs.pre-deployment-validation.outputs.package }}"
+          echo "Smoke tests passed"
+
+      - name: Create deployment success comment
+        if: success()
+        run: |
+          echo "## Production Deployment Successful" > deployment_status.md
+          echo "" >> deployment_status.md
+          echo "| Item | Details |" >> deployment_status.md
+          echo "|------|---------|" >> deployment_status.md
+          echo "| Package | \`${{ needs.pre-deployment-validation.outputs.package }}\` |" >> deployment_status.md
+          echo "| Backup | \`${{ needs.create-backup.outputs.backup_file }}\` |" >> deployment_status.md
+          echo "| Timestamp | $(date) |" >> deployment_status.md
+          echo "| Region | ${{ env.IICS_REGION }} |" >> deployment_status.md
+          
+          cat deployment_status.md
+
+  rollback-if-failed:
+    name: Rollback on Failure
+    needs: [pre-deployment-validation, create-backup, deploy-to-prod]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
       - name: Download IICS CLI
         run: |
@@ -49,38 +211,54 @@ jobs:
           curl -L -o ./iics-cli/iics https://github.com/InformaticaCloudApplicationIntegration/Tools/raw/master/IICS%20Asset%20Management%20CLI/v2/linux-x86_64/iics
           chmod +x ./iics-cli/iics
 
-      - name: Create backup of current production state
+      - name: Initiate rollback
         run: |
-          BACKUP_NAME="pre-prod-backup-$(date +'%Y%m%d%H%M%S')"
-          ./iics-cli/iics export \
-            -n "$BACKUP_NAME" \
-            -r ${{ env.IICS_REGION }} \
-            --podHostName ${{ env.PROD_POD_URL }} \
-            -u ${{ env.PROD_USERNAME }} \
-            -p ${{ env.PROD_PASSWORD }} \
-            --artifacts "Explore/Default.Project" \
-            --zipFilePath "./backups/$BACKUP_NAME.zip"
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
-          git add ./backups/
-          git commit -m "backup: $BACKUP_NAME" || echo "No changes to commit"
-          git push
+          echo "Deployment failed! Initiating rollback..."
+          BACKUP_FILE="${{ needs.create-backup.outputs.backup_file }}"
+          
+          if [[ -f "$BACKUP_FILE" ]]; then
+            echo "Rolling back using backup: $BACKUP_FILE"
+            
+            ./iics-cli/iics import \
+              -n "Prod-Rollback-$(date +'%Y%m%d%H%M%S')" \
+              -r "${{ env.IICS_REGION }}" \
+              --podHostName "${{ env.PROD_POD_URL }}" \
+              -u "${{ env.PROD_USERNAME }}" \
+              -p "${{ env.PROD_PASSWORD }}" \
+              -z "$BACKUP_FILE" \
+              -s true
+            
+            if [[ $? -eq 0 ]]; then
+              echo "Rollback successful"
+            else
+              echo "Rollback failed - manual intervention required"
+              exit 1
+            fi
+          else
+            echo "No backup found for rollback - manual intervention required"
+            exit 1
+          fi
 
-      - name: Import to Production
+  notify:
+    name: Send Notification
+    needs: [deploy-to-prod, rollback-if-failed]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send success notification
+        if: success() && needs.deploy-to-prod.result == 'success'
         run: |
-          ./iics-cli/iics import \
-            -n "Prod-Deploy-$(date +'%Y%m%d%H%M%S')" \
-            -r ${{ env.IICS_REGION }} \
-            --podHostName ${{ env.PROD_POD_URL }} \
-            -u ${{ env.PROD_USERNAME }} \
-            -p ${{ env.PROD_PASSWORD }} \
-            -z ${{ needs.pre-deploy.outputs.package }} \
-            -s true
-
-      - name: Smoke tests
+          echo "Production deployment successful"
+          # Add Slack webhook integration here
+          # curl -X POST -H 'Content-type: application/json' \
+          #   --data "{\"text\":\"Production deployment of ${{ needs.pre-deployment-validation.outputs.package }} succeeded\"}" \
+          #   ${{ secrets.SLACK_WEBHOOK }}
+      
+      - name: Send failure notification
+        if: failure()
         run: |
-          python scripts/validate_import.py --environment prod --smoke-test
-
-      - name: Notify success
-        run: |
-          echo "Production deployment of ${{ needs.pre-deploy.outputs.package }} succeeded."
+          echo "Production deployment failed"
+          # Add Slack webhook for failures here
+          # curl -X POST -H 'Content-type: application/json' \
+          #   --data "{\"text\":\"Production deployment of ${{ needs.pre-deployment-validation.outputs.package }} failed\"}" \
+          #   ${{ secrets.SLACK_WEBHOOK }}

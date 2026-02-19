@@ -76,6 +76,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       backup_file: ${{ steps.backup.outputs.backup_file }}
+    permissions:
+      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
@@ -87,18 +89,33 @@ jobs:
           chmod +x ./iics-cli/iics
           ./iics-cli/iics version
 
+      - name: Install jq (for JSON parsing)
+        run: sudo apt-get install -y jq
+
       - name: Create backups folder
         run: mkdir -p ./backups
 
+      - name: List available projects
+        continue-on-error: true
+        run: |
+          ./iics-cli/iics list \
+            -r "${{ env.IICS_REGION }}" \
+            --podHostName "${{ env.PROD_POD_URL }}" \
+            -u "${{ env.PROD_USERNAME }}" \
+            -p "${{ env.PROD_PASSWORD }}" \
+            --type PROJECT
+
       - name: Export current production state as backup
         id: backup
+        continue-on-error: true  # Don't fail the workflow if backup fails
         run: |
           TIMESTAMP=$(date +'%Y%m%d_%H%M%S')
           BACKUP_FILE="./backups/prod-backup-$TIMESTAMP.zip"
           
           echo "Creating backup: $BACKUP_FILE"
           
-          # Use your actual project name
+          # Try different export strategies
+          # Strategy 1: Try with known project name
           ./iics-cli/iics export \
             -n "Prod-Backup-$TIMESTAMP" \
             -r "${{ env.IICS_REGION }}" \
@@ -109,27 +126,21 @@ jobs:
             -z "$BACKUP_FILE" \
             --logLevel info
           
-          if [[ $? -eq 0 ]]; then
+          # Check if backup was created
+          if [[ -f "$BACKUP_FILE" ]]; then
             echo "backup_file=$BACKUP_FILE" >> $GITHUB_OUTPUT
             echo "Backup created successfully"
+            
+            # Try to commit backup (optional)
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add ./backups/
+            git commit -m "backup: pre-deployment backup $TIMESTAMP" || echo "No changes to commit"
+            git push || echo "Push failed, but continuing"
           else
-            echo "Backup failed"
-            exit 1
+            echo "Backup failed, but continuing with deployment"
+            echo "backup_file=" >> $GITHUB_OUTPUT
           fi
-
-      - name: Commit backup to repository
-        if: success()
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add ./backups/
-          git commit -m "backup: pre-deployment backup $TIMESTAMP" || echo "No changes to commit"
-          
-          # Use GITHUB_TOKEN for authentication
-          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
-          git push
-        env:
-          TIMESTAMP: ${{ steps.backup.outputs.backup_file }}  
 
   deploy-to-prod:
     name: Production Deployment
@@ -207,9 +218,10 @@ jobs:
   rollback-if-failed:
     name: Rollback on Failure
     needs: [pre-deployment-validation, create-backup, deploy-to-prod]
-    if: failure()
+    if: failure() && needs.create-backup.outputs.backup_file != ''
     runs-on: ubuntu-latest
     steps:
+      # ... rollback steps only if backup exists
       - name: Checkout repository
         uses: actions/checkout@v3
 

@@ -14,7 +14,7 @@ def main():
     if args.smoke_test:
         print("Running smoke tests...")
     # Simulate success
-    print("✅ Validation passed")
+    print("Validation passed")
     return 0
 
 if __name__ == "__main__":
